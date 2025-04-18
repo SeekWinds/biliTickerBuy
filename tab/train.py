@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 import gradio as gr
 
 from tab.go import ways_detail, ways
-from config import main_request
+from util.config import main_request
 
 
 def train_tab():
@@ -29,15 +29,13 @@ def train_tab():
 | 过码方式           | 使用说明                                                     |
 | ------------------ | ------------------------------------------------------------ |
 | 手动               | 自己过，速度取决于自己，过程看项目的readme.md的GIF           |
-| 使用打码平台 rrocr | **支持**手动和人工同时使用 <br /> rrocr 提供的 http://www.rrocr.com<br /> 能过验证码，但是抢票没有测试，慎用 <br /> 需要购买对应的key，速度比手动快，价格 一次大概一分钱<br /> |
-| 使用过码服务 CapSolver | **不支持**手动和人工同时使用<br />自动过码大约**需12秒起** <br />  CapSolver的过码方式<br />https://www.capsolver.com/zh <br />https://docs.capsolver.com/guide/captcha/Geetest.html|
 | 本地过验证码 | **推荐**<br />**不支持**手动和人工同时使用<br />本地过码，免费，不会收网速影响<br />成功率99%<br />速度快，正常**需3秒左右** <br /> https://github.com/Amorter/biliTicker_gt/releases|
 | .....              | 欢迎Discussion补充                                                     |
     
     """)
 
     # 验证码选择
-    way_select_ui = gr.Radio(ways, label="验证码", info="过验证码的方式", type="index", value="手动")
+    way_select_ui = gr.Radio(ways, label="验证码", info="过验证码的方式", type="index", value=ways[0])
     api_key_input_ui = gr.Textbox(label="api_key", value=_request.cookieManager.get_config_value("appkey", ""),
                                   visible=False)
     select_way = 0
@@ -56,7 +54,7 @@ def train_tab():
     way_select_ui.change(choose_option, inputs=way_select_ui, outputs=api_key_input_ui)
 
     test_get_challenge_btn = gr.Button("开始测试")
-    test_log = gr.JSON(label="测试结果（验证码过期是正常现象）")
+    test_log = gr.JSON(label="测试结果（显示验证码过期则说明成功）")
     with gr.Row(visible=False) as test_gt_row:
         test_gt_html_finish_btn = gr.Button("完成验证码后点此此按钮")
         gr.HTML(
@@ -115,7 +113,7 @@ def train_tab():
         def run_validation():
             nonlocal test_geetest_validate, test_geetest_seccode
             try:
-                tmp = validator.validate(appkey=api_key, gt=test_gt, challenge=test_challenge)
+                tmp = validator.validate(gt=test_gt, challenge=test_challenge)
             except Exception as e:
                 return
             validate_con.acquire()

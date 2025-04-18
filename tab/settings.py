@@ -1,14 +1,17 @@
 import json
 import os
 import re
+import shutil
 from datetime import datetime
+from typing import Any
 from urllib.parse import urlparse, parse_qs
 
 import gradio as gr
 from gradio_calendar import Calendar
 from loguru import logger
 
-from config import main_request, TEMP_PATH
+from util.BiliRequest import BiliRequest
+from util.config import TEMP_PATH, global_cookie_path, main_request, set_main_request
 
 buyer_value = []
 addr_value = []
@@ -17,6 +20,22 @@ project_name = []
 ticket_str_list = []
 sales_dates = []
 project_id = 0
+
+sales_flag_number_map = {
+    1: "不可售",
+    2: "预售",
+    3: "停售",
+    4: "售罄",
+    5: "不可用",
+    6: "库存紧张",
+    8: "暂时售罄",
+    9: "不在白名单",
+    101: "未开始",
+    102: "已结束",
+    103: "未完成",
+    105: "下架",
+    106: "已取消"
+}
 
 
 def filename_filter(filename):
@@ -74,7 +93,6 @@ def on_submit_ticket_id(num):
                 gr.update(visible=True),
                 gr.update(value=ret.get('msg', '未知错误') + '。', visible=True), gr.update()
             ]
-
         data = ret["data"]
         ticket_str_list = []
 
@@ -93,9 +111,25 @@ def on_submit_ticket_id(num):
         venue_address = venue_info["address_detail"]
         sales_dates = [t["date"] for t in data["sales_dates"]]
         sales_dates_show = len(data["sales_dates"]) != 0
+        for item in data["screen_list"]:
+            item["project_id"] = data["id"]
+        # 场贩
+        good_list = main_request.get(
+            url=f'https://show.bilibili.com/api/ticket/linkgoods/list?project_id={project_id}&page_type=0')
+        good_list = good_list.json()
+        ids = [item["id"] for item in good_list["data"]["list"]]
+        for id in ids:
+            good_detail = main_request.get(
+                url=f'https://show.bilibili.com/api/ticket/linkgoods/detail?link_id={id}')
+            good_detail = good_detail.json()
+            for item in good_detail["data"]["specs_list"]:
+                item["project_id"] = good_detail["data"]["item_id"]
+                item["link_id"] = id
+            data["screen_list"] += good_detail["data"]["specs_list"]
         for screen in data["screen_list"]:
             screen_name = screen["name"]
             screen_id = screen["id"]
+            project_id = screen["project_id"]
             express_fee = 0
             if data["has_eticket"]:
                 express_fee = 0  # 电子票免费
@@ -109,10 +143,12 @@ def on_submit_ticket_id(num):
                 ticket["price"] = ticket_price = ticket["price"] + express_fee
                 ticket["screen"] = screen_name
                 ticket["screen_id"] = screen_id
-                ticket_can_buy = ticket["sale_flag"]["display_name"]
-                ticket_str = f"{screen_name} - {ticket_desc} - ￥{ticket_price / 100}- {ticket_can_buy} - 【起售时间：{sale_start}】 "
+                if "link_id" in screen:
+                    ticket["link_id"] = screen["link_id"]
+                ticket_can_buy = sales_flag_number_map[ticket["sale_flag_number"]]
+                ticket_str = f"{screen_name} - {ticket_desc} - ￥{ticket_price / 100}- {ticket_can_buy} - 【起售时间：{sale_start}】"
                 ticket_str_list.append(ticket_str)
-                ticket_value.append({"project_id": project_id, "ticket": ticket})
+                ticket_value.append({"project_id": screen["project_id"], "ticket": ticket})
 
         buyer_json = main_request.get(
             url=f"https://show.bilibili.com/api/ticket/buyer/list?is_default&projectId={project_id}"
@@ -122,7 +158,6 @@ def on_submit_ticket_id(num):
             url="https://show.bilibili.com/api/ticket/addr/list"
         ).json()
         logger.debug(addr_json)
-
         buyer_value = buyer_json["data"]["list"]
         buyer_str_list = [
             f"{item['name']}-{item['personal_id']}" for item in buyer_value
@@ -163,11 +198,7 @@ def extract_id_from_url(url):
 
 def on_submit_all(ticket_id, ticket_info, people_indices, people_buyer_index, address_index):
     try:
-        # if ticket_number != len(people_indices):
-        #     return gr.update(
-        #         value="生成配置文件失败，保证选票数目和购买人数目一致", visible=True
-        #     )
-        ticket_cur = ticket_value[ticket_info]
+        ticket_cur: list[dict[str, Any]] = ticket_value[ticket_info]
         people_cur = [buyer_value[item] for item in people_indices]
         people_buyer_cur = buyer_value[people_buyer_index]
         ticket_id = extract_id_from_url(ticket_id)
@@ -175,19 +206,21 @@ def on_submit_all(ticket_id, ticket_info, people_indices, people_buyer_index, ad
             return [gr.update(value="你所填不是网址，或者网址是错的", visible=True),
                     gr.update(value={}),
                     gr.update()]
-        if str(ticket_id) != str(ticket_cur["project_id"]):
-            return [gr.update(value="当前票信息已更改，请点击“获取票信息”按钮重新获取", visible=True),
-                    gr.update(value={}),
-                    gr.update()]
         if len(people_indices) == 0:
             return [gr.update(value="至少选一个实名人", visible=True),
                     gr.update(value={}),
                     gr.update()]
+        if addr_value is None:
+            return [gr.update(value="没有填写地址", visible=True),
+                    gr.update(value={}),
+                    gr.update()]
         address_cur = addr_value[address_index]
-        detail = f'{project_name}-{ticket_str_list[ticket_info]}'
+        username = main_request.get_request_name()
+        detail = f'{username}-{project_name}-{ticket_str_list[ticket_info]}'
         for p in people_cur:
             detail += f"-{p['name']}"
         config_dir = {
+            "username": username,
             "detail": detail,
             "count": len(people_indices),
             "screen_id": ticket_cur["ticket"]["screen_id"],
@@ -207,7 +240,10 @@ def on_submit_all(ticket_id, ticket_info, people_indices, people_buyer_index, ad
                         + address_cur["area"]
                         + address_cur["addr"],
             },
+            "cookies": main_request.cookieManager.get_cookies(),
         }
+        if "link_id" in ticket_cur["ticket"]:
+            config_dir["link_id"] = ticket_cur["ticket"]["link_id"]
         filename = os.path.join(TEMP_PATH, filename_filter(detail) + ".json")
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(config_dir, f, ensure_ascii=False, indent=4)
@@ -220,20 +256,72 @@ def on_submit_all(ticket_id, ticket_info, people_indices, people_buyer_index, ad
 def setting_tab():
     gr.Markdown("""
 > **必看**
->
+> 
 > 保证自己在抢票前，已经配置了地址和购买人信息(就算不需要也要提前填写) 如果没填，生成表单时候不会出现任何选项
->
+> 
 > - 地址 ： 会员购中心->地址管理
 > - 购买人信息：会员购中心->购买人信息
 """)
     info_ui = gr.TextArea(
-        info="此窗口为输出信息", label="输出信息", interactive=False, visible=False
+        info="此窗口为输出信息", label="输出信息", interactive=False, visible=True
     )
+    with gr.Row():
+        username_ui = gr.Text(
+            main_request.get_request_name(),
+            label="账号名称",
+            interactive=False,
+            info="输出配置文件使用的账号名称",
+        )
+        gr_file_ui = gr.File(label="当前登录信息文件",
+                             value=global_cookie_path)
+    with gr.Row():
+        upload_ui = gr.UploadButton(label="导入")
+        add_btn = gr.Button("登录")
+
+        def upload_file(filepath):
+            yield ["已经注销，请选择登录信息文件", gr.update(), gr.update()]
+            try:
+                shutil.copy2(global_cookie_path, filepath)
+                set_main_request(BiliRequest(cookies_config_path=global_cookie_path))
+                name = main_request.get_request_name()
+                yield [gr.update(value="导入成功"), gr.update(value=name), gr.update(value=global_cookie_path)]
+            except Exception as e:
+                name = main_request.get_request_name()
+                logger.exception(e)
+                yield ["登录出现错误", gr.update(value=name), gr.update(value=global_cookie_path)]
+
+        upload_ui.upload(upload_file, [upload_ui], [info_ui, username_ui, gr_file_ui])
+
+        def add():
+            main_request.cookieManager.db.delete("cookie")
+            yield ["已经注销，将打开浏览器，请在浏览器里面重新登录", gr.update(value="未登录"),
+                   gr.update(value=global_cookie_path)]
+            try:
+                main_request.cookieManager.get_cookies_str_force()
+                name = main_request.get_request_name()
+                yield [f"登录成功", gr.update(value=name), gr.update(value=global_cookie_path)]
+            except Exception:
+                name = main_request.get_request_name()
+                yield ["登录出现错误", gr.update(value=name), gr.update(value=global_cookie_path)]
+
+        add_btn.click(
+            fn=add,
+            inputs=None,
+            outputs=[info_ui, username_ui, gr_file_ui]
+        )
+    with gr.Accordion(label='填写你的当前账号所绑定的手机号[可选]', open=False):
+        phone_gate_ui = gr.Textbox(label="填写你的当前账号所绑定的手机号", info="手机号验证出现概率极低，可不填",
+                                   value=main_request.cookieManager.get_config_value("phone", ""))
+
+        def input_phone(_phone):
+            main_request.cookieManager.set_config_value("phone", _phone)
+
+        phone_gate_ui.change(fn=input_phone, inputs=phone_gate_ui, outputs=None)
     with gr.Column():
         ticket_id_ui = gr.Textbox(
             label="想要抢票的网址",
             interactive=True,
-            info="例如：https://show.bilibili.com/platform/detail.html?id=84096",
+            info="https://show.bilibili.com/platform/detail.html?id=84096或者https://mall.bilibili.com/mall-dayu/neul-next/ticket/detail.html?id=97701",
         )
         ticket_id_btn = gr.Button("获取票信息")
         with gr.Column(visible=False) as inner:
@@ -322,6 +410,7 @@ def setting_tab():
                                       f" - 【起售时间：{sale_start}】")
                         ticket_str_list.append(ticket_str)
                         ticket_value.append({"project_id": project_id, "ticket": ticket})
+
                 return [gr.update(value=_date, visible=True), gr.update(choices=ticket_str_list),
                         gr.update(value=f"当前票日期更新为: {_date}")]
             except Exception as e:
